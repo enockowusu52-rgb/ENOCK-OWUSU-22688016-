@@ -38,10 +38,5 @@ Key findings highlight the importance of **inductive bias** and **task-architect
   - `forecast`
   - `reticulate`
 
-> Note: TensorFlow backend was properly installed via: 
-install.packages("keras3")
-library(keras3)
-install_keras()
-
 ## Author
 Enock Owusu (Mr.)
