@@ -29,6 +29,7 @@ Key findings highlight the importance of **inductive bias** and **task-architect
 **R version:** R 4.5.3
 **Packages used:**
   - `keras`
+  - `keras3`
   - `tensorflow`
   - `tidyverse`
   - `ggplot2`
