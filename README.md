@@ -6,7 +6,7 @@ This project investigates and compares the performance of multiple deep learning
 
 1. **Jena Climate Dataset (Regression & Classification)**  
    - Regression: Predict temperature 24 hours ahead using a 120-hour lookback window.  
-   - Classification: Categorize future temperature into four classes (Cold, Cool, Mild, Warm).
+   - Classification: Categorise future temperature into four classes (Cold, Cool, Mild, Warm).
 
 2. **MNIST Dataset (Classification)**  
    - Classify handwritten digits (0–9) using DNN, CNN, and LSTM-based approaches.
@@ -38,8 +38,7 @@ Key findings highlight the importance of **inductive bias** and **task-architect
   - `forecast`
   - `reticulate`
 
-> Note: TensorFlow backend was properly installed via:
-```r
+> Note: TensorFlow backend was properly installed via: 
 install.packages("keras3")
 library(keras3)
 install_keras()
