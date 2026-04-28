@@ -2,7 +2,7 @@
 Regression and Classification with Multi-Architecture (Deep) Neural Networks 
 
 ## Description
-This project investigates and compares the performance of multiple deep learning architectures—Deep Neural Networks (DNN), Convolutional Neural Networks (CNN), Long Short-Term Memory networks (LSTM), and a custom CNN–LSTM hybrid—on two different tasks:
+This project investigates and compares the performance of multiple deep learning architectures: Deep Neural Networks (DNN), Convolutional Neural Networks (CNN), Long Short Term Memory networks (LSTM), and a custom CNN–LSTM hybrid on two different tasks:
 
 1. **Jena Climate Dataset (Regression & Classification)**  
    - Regression: Predict temperature 24 hours ahead using a 120-hour lookback window.  
