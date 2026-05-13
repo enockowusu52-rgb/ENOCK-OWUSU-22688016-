@@ -1,0 +1,1992 @@
+---
+title: "Final Project: Regression and Classification with Neural Networks"
+author: "Enock Owusu (22688016)"
+format: pdf
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+set.seed(260408)
+
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(corrplot)
+library(ggplot2)
+library(forecast)
+library(tseries)
+library(keras3)
+library(tensorflow)
+```
+
+# **Part 0: Data Preparation and Exploratory Analysis**
+
+This section of the project looks at regression and classification tasks using multiple neural network architectures including DNN, CNN, LSTM, and hybrid models. Also data preparation and exploratory analysis was also conducted.
+
+# **2.1 Jena Climate Dataset**
+
+```{r}
+jena <- read.csv(choose.files(), header = TRUE)
+str(jena)
+head(jena)
+rows_before <- nrow(jena)
+jena$Date.Time <- dmy_hms(jena$Date.Time)
+jena_hourly <- jena %>%
+  mutate(Date.Hour = floor_date(Date.Time, "hour")) %>%
+  group_by(Date.Hour) %>%
+  summarise(
+    across(where(is.numeric), mean, na.rm = TRUE),
+    .groups = "drop"
+  )
+rows_after <- nrow(jena_hourly)
+rows_before
+rows_after
+head(jena_hourly)
+str(jena_hourly)
+```
+
+# **Brief Description**
+
+The Jena Climate dataset was imported from the given CSV file, and then the Date Time column was properly transformed to a datetime format using the `lubridate` library. The original dataset contained measurements made at every ten minutes. In order to adapt the data for the modelling purposes, the resampling of the data was done by changing the observation frequency from 10 minutes to one hour where the average value of all numeric variables for the respective hour was calculated. The data was converted to hourly observations because the models were trained using a 120-hour look-back window. There were `r rows_before` observations before performing the resampling procedure; however, after resampling there remained `r rows_after` observations only.
+
+```{r}
+missing_values <- colSums(is.na(jena_hourly))
+missing_values
+
+```
+
+# **Missing Values Analysis**
+
+Missing values in the dataset were tested by finding the total number of missing observations per variable in the dataset. It is obvious that there are no  missing values of significance exist within all the variables after the resampling process done on an hourly basis.
+
+```{r}
+# Plot of temperature series
+ggplot(jena_hourly, aes(x = Date.Hour, y = T..degC.)) +
+  geom_line(color = "green") +
+  labs(title = "Full Temperature Time Series",
+       x = "Time",
+       y = "Temperature (°C)") +
+  theme_minimal()
+
+```
+
+```{r}
+# Tseries Plot for first 10 days of Temperature.
+first_10_days <- jena_hourly %>%
+  filter(Date.Hour <= min(Date.Hour) + days(10))
+
+ggplot(first_10_days, aes(x = Date.Hour, y = T..degC.)) +
+  geom_line(color = "cyan") +
+  labs(title = "First 10 Days Temperature (Hourly)",
+       x = "Time",
+       y = "Temperature (°C)") +
+  theme_minimal()
+  
+```
+
+# **Time Series Visualization**
+
+The complete temperature data shows definite trends in terms of seasons. There is a periodic rise and fall in temperatures every year, which clearly indicates that there is an underlying seasonality in temperature trends. This is evident by the graph plotted for the first ten days' temperatures measured per hour, which shows a definite diurnal trend. This trend shows a definite increase in temperatures during the day and fall during the night. This shows that there is significant variation within the day as well. Seasonality and diurnal trends make it essential to choose 120 hours as the look-back period.
+
+```{r}
+#  correlations among the numeric variables
+numeric_data <- jena_hourly %>%
+  select(where(is.numeric))
+
+cor_matrix <- cor(numeric_data)
+
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.cex = 0.7, tl.col = "red")
+```
+
+# **Correlation Analysis and Multicollinearity**
+
+In the correlation matrix, the relationship between all predictor variables included in the data set is highlighted. Many variables demonstrate a high positive or negative correlation, especially when comparing variables related to temperature, such as `T..degC.`, `Tpot..K.`, `Tdew..degC.`, and those related to vapour pressure. In turn, this suggests that there is a problem of multicollinearity in which predictors provide redundant data.
+
+```{r}
+# How temperature relates to its previous values
+temperature_series <- jena_hourly$T..degC.
+
+acf(temperature_series,
+    lag.max = 169,
+    main = "ACF of Hourly Temperature Series")
+
+pacf(temperature_series,
+     lag.max = 169,
+     main = "PACF of Hourly Temperature Series")
+
+```
+
+# **ACF and PACF Interpretation**
+
+The ACF plot shows that temperature values are highly correlated across many previous hours. The slow decay in the autocorrelation function suggests strong temporal dependence in the series. This is expected because current temperature is influenced by recent past temperatures. The PACF plot also shows important partial correlations at earlier lags, indicating that past hourly observations contain useful predictive information. The use of a 120-hour lookback window is therefore appropriate because it allows the model to use five days of historical weather information to predict temperature 24 hours ahead. This window is long enough to capture short-term hourly variation, daily cycles, and broader multi-day temperature patterns.
+
+```{r}
+# Compare the spread of the predictor variables (Boxplot)
+predictor_data <- jena_hourly %>%
+  select(-Date.Hour)
+
+predictor_long <- predictor_data %>%
+  pivot_longer(cols = everything(),
+               names_to = "Variable",
+               values_to = "Value")
+
+ggplot(predictor_long, aes(x = Variable, y = Value)) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(title = "Boxplots of Jena Climate Predictor Variables",
+       x = "Predictor Variables",
+       y = "Observed Values") +
+  theme_minimal()
+```
+
+### **Predictor Range and Need for Normalization**
+The box plots indicate that the predictor variables are highly diverse in terms of their scales of measurement. Predictor variables include those related to atmospheric pressure, temperature, humidity, wind direction, and vapor pressure, among others, which differ from each other in terms of their units and numerical scale. This validates the necessity of performing normalization before applying the neural network model. The reason for doing so is that neural networks are affected by the magnitude of the predictor variables.
+
+```{r}
+# Split the Jena data by year, not randomly. Train/Validation/Test Split
+train_data <- jena_hourly %>%
+  filter(Date.Hour >= ymd_hms("2009-01-01 00:00:00"),
+         Date.Hour <  ymd_hms("2015-01-01 00:00:00"))
+
+val_data <- jena_hourly %>%
+  filter(Date.Hour >= ymd_hms("2015-01-01 00:00:00"),
+         Date.Hour <  ymd_hms("2016-01-01 00:00:00"))
+
+test_data <- jena_hourly %>%
+  filter(Date.Hour >= ymd_hms("2016-01-01 00:00:00"),
+         Date.Hour <  ymd_hms("2017-01-01 00:00:00"))
+
+numeric_cols <- names(jena_hourly %>% select(where(is.numeric)))
+
+train_mean <- train_data %>%
+  select(all_of(numeric_cols)) %>%
+  summarise(across(everything(), mean, na.rm = TRUE))
+
+train_sd <- train_data %>%
+  select(all_of(numeric_cols)) %>%
+  summarise(across(everything(), sd, na.rm = TRUE))
+
+normalize_with_train_stats <- function(data, mean_values, sd_values) {
+  data_scaled <- data
+  
+  data_scaled[numeric_cols] <- sweep(
+    data_scaled[numeric_cols],
+    2,
+    as.numeric(mean_values),
+    FUN = "-"
+  )
+  
+  data_scaled[numeric_cols] <- sweep(
+    data_scaled[numeric_cols],
+    2,
+    as.numeric(sd_values),
+    FUN = "/"
+  )
+  
+  return(data_scaled)
+}
+
+# Applying the same scaling to all splits
+train_scaled <- normalize_with_train_stats(train_data, train_mean, train_sd)
+val_scaled   <- normalize_with_train_stats(val_data, train_mean, train_sd)
+test_scaled  <- normalize_with_train_stats(test_data, train_mean, train_sd)
+
+summary(train_scaled %>% select(where(is.numeric)))
+```
+
+# **Z-score Normalization**
+
+Z-score normalization was applied to all numeric variables using only the mean and standard deviation computed from the training set. The validation and test sets were then transformed using the same training-set statistics. This is important because validation and test data must represent unseen future observations. If their means and standard deviations are used during scaling, information from the future would leak into the training process.
+
+```{r}
+# Creating temperature target 24 hours ahead
+jena_hourly <- jena_hourly %>%
+  arrange(Date.Hour) %>%
+  mutate(
+    temp_24h_ahead = lead(T..degC., 24),
+    temp_class = case_when(
+      temp_24h_ahead < 0 ~ "Cold",
+      temp_24h_ahead >= 0  & temp_24h_ahead < 10 ~ "Cool",
+      temp_24h_ahead >= 10 & temp_24h_ahead < 20 ~ "Mild",
+      temp_24h_ahead >= 20 ~ "Warm",
+      TRUE ~ NA_character_
+    )
+  )
+
+jena_class <- jena_hourly %>%
+  filter(!is.na(temp_24h_ahead),
+         !is.na(temp_class))
+
+class_freq <- jena_class %>%
+  count(temp_class) %>%
+  mutate(percentage = round(100 * n / sum(n), 2))
+
+class_freq
+```
+
+```{r}
+# Plot the class counts
+ggplot(class_freq, aes(x = temp_class, y = n)) +
+  geom_col() +
+  labs(title = "Class Frequencies for 24-Hour-Ahead Temperature",
+       x = "Temperature Class",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+# **A Derived Temperature Classification Label**
+
+A four-class classification target was created from the 24-hour-ahead temperature. Temperatures below 0°C were classified as Cold, temperatures from 0°C to 9.9°C as Cool, temperatures from 10°C to 19.9°C as Mild, and temperatures of 20°C or above as Warm. The class frequency table above shows the distribution of the four temperature categories. 
+
+```{r}
+data_generator <- function(data,
+                           lookback = 120,
+                           delay = 24,
+                           step = 1,
+                           batch_size = 128,
+                           shuffle = FALSE,
+                           task = "regression") {
+  data_values <- as.matrix(data %>% select(where(is.numeric)))
+  
+  max_index <- nrow(data_values) - delay - 1
+  
+  function() {
+    
+    if (shuffle) {
+      rows <- sample((lookback + 1):max_index, size = batch_size)
+    } else {
+      rows <- seq(lookback + 1, min(lookback + batch_size, max_index))
+    }
+    
+    samples <- array(0, dim = c(length(rows), lookback, ncol(data_values)))
+    
+    if (task == "classification") {
+      targets <- matrix(0, nrow = length(rows), ncol = 4)
+    } else {
+      targets <- numeric(length(rows))
+    }
+    
+    for (j in seq_along(rows)) {
+      idx <- rows[j]
+      indices <- seq(idx - lookback, idx - 1, by = step)
+      
+      samples[j,,] <- data_values[indices,]
+      
+      if (task == "regression") {
+        targets[j] <- data$T..degC.[idx + delay]
+      } else {
+        class_label <- data$temp_class[idx + delay]
+        targets[j,] <- as.numeric(factor(class_label,
+                                         levels = c("Cold","Cool","Mild","Warm")))
+      }
+    }
+    
+    list(samples, targets)
+  }
+}
+```
+
+```{r}
+# Creating generators for train, validation and test sets
+train_gen <- data_generator(train_scaled, shuffle = TRUE, task = "regression")
+val_gen   <- data_generator(val_scaled, shuffle = FALSE, task = "regression")
+test_gen  <- data_generator(test_scaled, shuffle = FALSE, task = "regression")
+
+```
+
+```{r}
+# Checking the batch shapes before modelling
+batch <- train_gen()
+
+dim(batch[[1]])  # samples
+dim(batch[[2]])  # targets
+```
+
+# **Data Generator Function**
+
+A custom data generator function was developed to construct input-output sequences suitable for neural network training. The function accepts parameters including lookback (120 hours), delay (24 hours), step size, batch size, shuffle option, and task type (regression or classification). For each sample, the generator extracts a sequence of past observations over a 120-hour window and pairs it with a target value corresponding to the temperature 24 hours ahead. This sliding window approach transforms the time-series data into a supervised learning format. For regression tasks, the target is the continuous temperature value. For classification tasks, the target is the categorical temperature class (Cold, Cool, Mild, Warm), encoded appropriately. The generated input data has a three-dimensional structure: (batch size, time steps, number of features), which is suitable for deep learning architectures such as DNN, CNN, and LSTM. 
+```{r}
+# Loading the MNIST data from Keras
+mnist <- dataset_mnist()
+
+x_train_raw <- mnist$train$x
+y_train_raw <- mnist$train$y
+
+x_test_raw <- mnist$test$x
+y_test_raw <- mnist$test$y
+
+dim(x_train_raw)
+dim(x_test_raw)
+
+range(x_train_raw)
+range(x_test_raw)
+```
+
+### **0.B MNIST**
+
+MNIST Handwritten Digit Dataset was imported by invoking the function “dataset_mnist()” in Keras library. The training dataset comprises 60,000 grayscale images, while the test dataset comprises 10,000 images. Every image is of size 28×28 pixels. The pixel intensity lies between 0 and 255.
+
+```{r}
+# Scale the image pixels to values between 0 and 1
+x_train <- x_train_raw / 255
+x_test  <- x_test_raw / 255
+
+# Use the last 10,000 training images for validation
+# Last 10,000 training images used for validation
+x_val <- x_train[50001:60000,,]
+y_val <- y_train_raw[50001:60000]
+
+x_train_final <- x_train[1:50000,,]
+y_train_final <- y_train_raw[1:50000]
+
+# Check the split sizes
+dim(x_train_final)
+dim(x_val)
+dim(x_test)
+```
+
+```{r}
+# Displaying sample digit images
+par(mfrow = c(5, 2), mar = c(1, 1, 2, 1))
+
+for (i in 1:10) {
+  image(
+    t(apply(x_train_final[i,,], 2, rev)),
+    col = gray.colors(256),
+    axes = FALSE,
+    main = paste("Label:", y_train_final[i])
+  )
+}
+```
+
+### **Sample MNIST Images**
+Five by two grids of sample images for the MNIST dataset were shown alongside their respective label numbers. These images consist of handwritten digits ranging from 0 through 9 presented in grayscale images.
+
+```{r}
+# class frequecies
+mnist_class_freq <- as.data.frame(table(y_train_final))
+
+colnames(mnist_class_freq) <- c("Digit", "Frequency")
+
+mnist_class_freq$Percentage <- round(
+  100 * mnist_class_freq$Frequency / sum(mnist_class_freq$Frequency),
+  2
+)
+
+mnist_class_freq
+```
+
+```{r}
+# Plot the class counts
+ggplot(mnist_class_freq, aes(x = Digit, y = Frequency)) +
+  geom_col() +
+  labs(title = "MNIST Training Class Frequencies",
+       x = "Digit Class",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+```{r}
+# Flatten the images for the DNN
+x_train_dnn <- array_reshape(x_train_final, c(nrow(x_train_final), 28 * 28))
+x_val_dnn   <- array_reshape(x_val, c(nrow(x_val), 28 * 28))
+x_test_dnn  <- array_reshape(x_test, c(nrow(x_test), 28 * 28))
+
+x_train_cnn <- array_reshape(x_train_final, c(nrow(x_train_final), 28, 28, 1))
+x_val_cnn   <- array_reshape(x_val, c(nrow(x_val), 28, 28, 1))
+x_test_cnn  <- array_reshape(x_test, c(nrow(x_test), 28, 28, 1))
+
+y_train_cat <- to_categorical(y_train_final, num_classes = 10)
+y_val_cat   <- to_categorical(y_val, num_classes = 10)
+y_test_cat  <- to_categorical(y_test_raw, num_classes = 10)
+
+# Verify shapes
+dim(x_train_dnn)
+dim(x_train_cnn)
+dim(y_train_cat)
+```
+
+# **Input Transformations for Neural Networks**
+
+For the DNN baseline, each 28 × 28 image was reshaped into a 784-dimensional vector. This format is suitable for fully connected dense layers, which require one-dimensional input features. For the CNN model, the original spatial image structure was preserved by reshaping each image into a 28 × 28 × 1 tensor. The final dimension represents the single grayscale channel. This format allows convolutional layers to learn local spatial patterns such as edges, curves, and digit strokes. The digit labels were also converted into one-hot encoded vectors with 10 classes, which is required when using categorical cross-entropy loss with a softmax output layer.
+
+# **Part I: Vanilla Deep Neural Network**
+
+```{r}
+# Building the Jena DNN regression model
+sample_batch <- train_gen()
+num_features <- dim(sample_batch[[1]])[3]
+dnn_reg_model <- keras_model_sequential() %>%
+  layer_flatten(input_shape = c(120, num_features)) %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dense(units = 1, activation = "linear")
+summary(dnn_reg_model)
+```
+
+### ***Regression DNN Architecture***
+
+A simple deep neural network architecture has been chosen to serve as a base model for forecasting temperatures in Jena. As there are 120 samples of data per hour for each predictive variable, the input was converted from multi-dimensional to one-dimensional and fed into densely connected layers. Two hidden layers using rectified linear unit (ReLU) activation have been utilised in the proposed model. ReLU was chosen as an activation function since it brings nonlinearity into a neural network while mitigating the problem of vanishing gradients in contrast to sigmoid or hyperbolic tangent (tanh). There are 128 neurones in the first hidden layer and 64 neurones in the second hidden layer. One linearly activated neurone is contained in the output layer. Linear activation makes sense for regression, as the dependent variable, 24-hour-ahead temperature, is not bounded and can be either positive or negative.
+
+# **Design a DNN**
+```{r}
+count_trainable_params <- function(model) {
+  sum(sapply(model$trainable_weights, keras::k_count_params))
+}
+
+batch_size <- 128
+steps_per_epoch <- 200
+validation_steps <- 50
+epochs <- 50
+
+early_stop <- callback_early_stopping(
+  monitor = "val_mae",
+  patience = 5,
+  restore_best_weights = TRUE
+)
+```
+
+## **DNN Without Regularization**
+
+```{r}
+# Dnn model 1: no regularization
+dnn_no_reg <- keras_model_sequential() %>%
+  layer_flatten(input_shape = c(120, num_features)) %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dense(units = 1, activation = "linear")
+
+dnn_no_reg %>% compile(
+  optimizer = optimizer_adam(),
+  loss = "mae",
+  metrics = c("mae")
+)
+
+summary(dnn_no_reg)
+
+params_no_reg <- count_trainable_params(dnn_no_reg)
+params_no_reg
+```
+
+```{r}
+history_no_reg <- dnn_no_reg %>% fit(
+  train_gen,
+  steps_per_epoch = steps_per_epoch,
+  epochs = epochs,
+  validation_data = val_gen,
+  validation_steps = validation_steps,
+  callbacks = list(early_stop)
+)
+```
+
+# **DNN with Dropout**
+
+```{r}
+# Dnn model 2: dropout
+dnn_dropout <- keras_model_sequential() %>%
+  layer_flatten(input_shape = c(120, num_features)) %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dropout(rate = 0.30) %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dropout(rate = 0.30) %>%
+  layer_dense(units = 1, activation = "linear")
+
+dnn_dropout %>% compile(
+  optimizer = optimizer_adam(),
+  loss = "mae",
+  metrics = c("mae")
+)
+
+summary(dnn_dropout)
+
+params_dropout <- count_trainable_params(dnn_dropout)
+params_dropout
+
+```
+
+```{r}
+history_dropout <- dnn_dropout %>% fit(
+  train_gen,
+  steps_per_epoch = steps_per_epoch,
+  epochs = epochs,
+  validation_data = val_gen,
+  validation_steps = validation_steps,
+  callbacks = list(early_stop)
+)
+```
+
+# **DNN with L2 Weight Decay**
+
+```{r}
+# Dnn model 3: l2 regularization
+dnn_l2 <- keras_model_sequential() %>%
+  layer_flatten(input_shape = c(120, num_features)) %>%
+  layer_dense(
+    units = 128,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(0.001)
+  ) %>%
+  layer_dense(
+    units = 64,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(0.001)
+  ) %>%
+  layer_dense(units = 1, activation = "linear")
+
+dnn_l2 %>% compile(
+  optimizer = optimizer_adam(),
+  loss = "mae",
+  metrics = c("mae")
+)
+
+summary(dnn_l2)
+
+params_l2 <- count_trainable_params(dnn_l2)
+params_l2
+```
+
+```{r}
+history_l2 <- dnn_l2 %>% fit(
+  train_gen,
+  steps_per_epoch = steps_per_epoch,
+  epochs = epochs,
+  validation_data = val_gen,
+  validation_steps = validation_steps,
+  callbacks = list(early_stop)
+)
+```
+
+## **Parameter Count Table**
+
+```{r}
+dnn_param_table <- data.frame(
+  Model = c("DNN No Regularization", "DNN Dropout", "DNN L2 Regularization"),
+  Trainable_Parameters = c(params_no_reg, params_dropout, params_l2)
+)
+
+dnn_param_table
+```
+
+## **Learning Curves for the Three DNN Variants**
+
+```{r}
+# Extract learning curves
+extract_history <- function(history, model_name) {
+  data.frame(
+    Epoch = seq_along(history$metrics$mae),
+    Training_MAE = history$metrics$mae,
+    Validation_MAE = history$metrics$val_mae,
+    Model = model_name
+  )
+}
+
+hist_no_reg <- extract_history(history_no_reg, "No Regularization")
+hist_dropout <- extract_history(history_dropout, "Dropout")
+hist_l2 <- extract_history(history_l2, "L2 Regularization")
+
+dnn_history_all <- bind_rows(hist_no_reg, hist_dropout, hist_l2)
+
+dnn_history_long <- dnn_history_all %>%
+  pivot_longer(
+    cols = c(Training_MAE, Validation_MAE),
+    names_to = "Curve",
+    values_to = "MAE"
+  )
+
+ggplot(dnn_history_long, aes(x = Epoch, y = MAE, linetype = Curve)) +
+  geom_line() +
+  facet_wrap(~ Model, scales = "free_y") +
+  labs(
+    title = "Learning Curves for DNN Regression Variants",
+    x = "Epoch",
+    y = "Mean Absolute Error"
+  ) +
+  theme_minimal()
+```
+
+# **Training of DNN Regression Models**
+
+Training of the three regression models was done through the Adam optimiser and loss function consisting of the mean absolute error. MAE loss was preferred since it represents the mean difference between the predictions and observations, expressed in degrees Celsius. In training the models, early stopping with patience of 5 epochs based on validation MAE was performed. That is, training ended automatically when the model failed to make improvements in validation MAE for five consecutive epochs. Moreover, the best model parameters were restored at the end of the training process to prevent an overfitted model from being retained. In all, three versions of the DNN (Deep Neural Network) were employed. For the first, no regularisation was used, representing the baseline model. The second model included a dropout technique for deactivating a portion of the neurones. The final model used weight decay through an L2 penalty. Learning curves were plotted to identify the bias/variance characteristics of each model. In cases where the no-regularisation model yields lower training MAE but higher validation MAE, then the model is said to be highly variegated due to overfitting. The dropout and L2 techniques are meant to address the issue of overfitting by enhancing regularisation.
+
+# **Select the Best DNN Variant**
+
+```{r}
+# Select best dnn variant
+best_val_mae <- c(
+  No_Regularization = min(history_no_reg$metrics$val_mae),
+  Dropout = min(history_dropout$metrics$val_mae),
+  L2_Regularization = min(history_l2$metrics$val_mae)
+)
+
+best_val_mae
+
+best_model_name <- names(which.min(best_val_mae))
+best_model_name
+
+best_dnn_model <- switch(
+  best_model_name,
+  "No_Regularization" = dnn_no_reg,
+  "Dropout" = dnn_dropout,
+  "L2_Regularization" = dnn_l2
+)
+```
+
+# **Creating Test Arrays For Evaluation**
+
+```{r}
+# Creating test arrays for evaluation
+make_sequences <- function(data, lookback = 120, delay = 24) {
+  
+  data_values <- as.matrix(data %>% select(where(is.numeric)))
+  max_index <- nrow(data_values) - delay
+  
+  rows <- (lookback + 1):max_index
+  
+  samples <- array(0, dim = c(length(rows), lookback, ncol(data_values)))
+  targets <- numeric(length(rows))
+  
+  for (j in seq_along(rows)) {
+    idx <- rows[j]
+    indices <- (idx - lookback):(idx - 1)
+    samples[j,,] <- data_values[indices,]
+    targets[j] <- data$T..degC.[idx + delay]
+  }
+  
+  list(samples = samples, targets = targets)
+}
+
+test_seq <- make_sequences(test_scaled, lookback = 120, delay = 24)
+
+x_test_jena <- test_seq$samples
+y_test_jena <- test_seq$targets
+
+dim(x_test_jena)
+length(y_test_jena)
+```
+
+# **Predictions From the Best DNN Model**
+
+```{r}
+# Predictions from best dnn model
+dnn_pred <- best_dnn_model %>%
+  predict(x_test_jena)
+
+dnn_pred <- as.numeric(dnn_pred)
+```
+
+# **Test Metrics**
+
+```{r}
+# Test metrics
+test_mae <- mean(abs(y_test_jena - dnn_pred))
+
+test_rmse <- sqrt(mean((y_test_jena - dnn_pred)^2))
+
+test_r2 <- 1 - sum((y_test_jena - dnn_pred)^2) /
+  sum((y_test_jena - mean(y_test_jena))^2)
+
+dnn_test_results <- data.frame(
+  Best_Model = best_model_name,
+  Test_MAE = round(test_mae, 4),
+  Test_RMSE = round(test_rmse, 4),
+  Test_R2 = round(test_r2, 4)
+)
+
+dnn_test_results
+```
+
+## **Naive Baseline: Predict T+24 = T+0**
+
+```{r}
+# Predicting future temperature using current temperature
+naive_pred <- numeric(length(y_test_jena))
+
+for (j in seq_along(naive_pred)) {
+  current_index <- 120 + j
+  naive_pred[j] <- test_scaled$T..degC.[current_index]
+}
+
+naive_mae <- mean(abs(y_test_jena - naive_pred))
+
+baseline_comparison <- data.frame(
+  Model = c("Naive Baseline", paste("Best DNN:", best_model_name)),
+  Test_MAE = c(round(naive_mae, 4), round(test_mae, 4))
+)
+
+baseline_comparison
+```
+
+## **One-Week Predicted vs Actual Plot**
+
+```{r}
+# One week test predictions
+one_week_hours <- 24 * 7
+
+plot_data_week <- data.frame(
+  Time = test_data$Date.Hour[(120 + 24 + 1):(120 + 24 + one_week_hours)],
+  Actual = y_test_jena[1:one_week_hours],
+  Predicted = dnn_pred[1:one_week_hours]
+)
+
+plot_data_long <- plot_data_week %>%
+  pivot_longer(cols = c(Actual, Predicted),
+               names_to = "Series",
+               values_to = "Temperature")
+
+ggplot(plot_data_long, aes(x = Time, y = Temperature, linetype = Series)) +
+  geom_line() +
+  labs(
+    title = "Predicted vs Actual Temperature for One Week of Test Data",
+    x = "Date",
+    y = "Temperature"
+  ) +
+  theme_minimal()
+```
+
+# **Test Evaluation of the Best DNN Variant**
+
+Selection of the best-performing model relied on the minimum MAE value of the validation samples. As a result, the final model is chosen with regard for its ability to perform well on unseen validation data.
+
+The best DNN performed with an MAE of `r round(test_mae, 4)`, RMSE of `r round(test_rmse, 4)` and R² of `r round(test_r2, 4)` on the test set. The MAE represents the mean of the absolute differences between the predicted values and the target variable in temperature units. RMSE is used to punish models for making predictions that differ considerably from actual results. Finally, R² is the share of the 24-hour-ahead temperature variability explained by the model.
+
+A visual interpretation of the predictive power of the model can be provided with the use of a one-week prediction plot. It shows the accuracy of the predictions compared to the changes in the temperature.
+
+Naive baseline predicts 24-hour-ahead temperature by taking into account the temperature at the moment of prediction. Its MAE value equals to `r round(naive_mae, 4)`. A comparison of the MAE values of naive baseline and the best-performing DNN allows concluding about the model's predictive value. In case the MAE of the DNN is lower, it means that a prediction model provides additional insight.
+
+# **2-D convolutional filter operates on a greyscale image versus 1-D filter operates on a multivariate time-series window**
+
+A 2-D convolutional filter operates on a greyscale image by moving across the image in two directions: height and width. At each position, the filter covers a small local patch of pixels, such as a 3×3 region, and computes a weighted sum of the pixel values. This produces a feature map that helps detect spatial patterns such as edges, curves, corners, and digit strokes. A 1-D convolutional filter operates differently because it moves along only one main direction: time. In a multivariate time-series window, the filter slides across consecutive time steps and examines short temporal segments. 
+
+# **inductive bias and parameter efficiency**
+
+Inductive bias shared by both 2D and 1D convolution models is locality in connections as well as parameter sharing. Locality of connections means that features in small neighbourhoods are more correlated than those far apart. In case of an image, the features within close proximity correspond to visual concepts, while, for time series, adjacent points tend to represent a particular pattern. The principle of parameter sharing allows applying the same kernel to different parts of the input data. Rather than training separate weights for all pixels or points, CNN trains a single filter and utilises it multiple times, which results in fewer parameters being trained when compared to traditional DNN.
+
+# **Why local connectivity suits images and time series but is less natural for tabular data**
+
+Local connectivity is well-suited for image data since adjacent pixels belong to the same pattern most of the time. For instance, the strokes used to write a handwritten number are composed of pixels adjacent to each other. Thus, a local filter can extract useful features from them. Local connectivity is also well-suited for time-series data since values that are closer in time tend to be related. For instance, current temperatures are highly related to previous temperatures. Thus, a 1-D filter, which is a type of algorithm that processes data in a single dimension, is able to pick up the relations existing in a short period of time. However, local connectivity is not suited for tabular data because there isn't a spatial or temporal connection between variables in a tabular dataset.
+
+# **II.B(a) 2D-CNN for MNIST Classification**
+
+```{r}
+# Building the CNN model for MNIST
+cnn_mnist <- keras_model_sequential() %>%
+  layer_conv_2d(
+    filters = 32,
+    kernel_size = c(3, 3),
+    activation = "relu",
+    padding = "same",
+    input_shape = c(28, 28, 1)
+  ) %>%
+  layer_conv_2d(
+    filters = 64,
+    kernel_size = c(3, 3),
+    activation = "relu",
+    padding = "same"
+  ) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dense(units = 10, activation = "softmax")
+
+summary(cnn_mnist)
+```
+
+# **Interpretation**
+
+The 2D-CNN architecture utilises the input shape `(28, 28, 1)` where the images are 28×28 in size and represent greyscale images with only one colour channel. The model has two Conv2D layers followed by rectified linear unit (ReLU) activation and same-padding. This allows for extracting spatially localised features such as edges, curves, and strokes from the digits. The MaxPooling2D layer allows for dimensionality reduction of the output but preserves important features from the previous layers. Lastly, the fully connected layer was used to classify the input data into one of the 10 classes using softmax activation.
+
+# **Compile the CNN Model**
+
+```{r}
+# Compilation of the CNN model
+cnn_mnist %>% compile(
+  optimizer = optimizer_adam(),
+  loss = "categorical_crossentropy",
+  metrics = c("accuracy")
+)
+
+early_stop_cnn <- callback_early_stopping(
+  monitor = "val_loss",
+  patience = 5,
+  restore_best_weights = TRUE
+)
+```
+
+# **Training Time per Epoch**
+
+```{r}
+# Training time per epoch
+start_time <- Sys.time()
+
+history_cnn_mnist <- cnn_mnist %>% fit(
+  x_train_cnn, y_train_cat,
+  epochs = 20,
+  batch_size = 128,
+  validation_data = list(x_val_cnn, y_val_cat),
+  callbacks = list(early_stop_cnn)
+)
+
+end_time <- Sys.time()
+
+cnn_total_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+cnn_epochs_run <- length(history_cnn_mnist$metrics$loss)
+cnn_time_per_epoch <- cnn_total_time / cnn_epochs_run
+
+cnn_time_per_epoch  
+```
+
+# **Test Accuracy**
+
+```{r}
+# Test accuracy
+cnn_eval <- cnn_mnist %>% evaluate(x_test_cnn, y_test_cat)
+
+cnn_test_loss <- cnn_eval["loss"]
+cnn_test_accuracy <- cnn_eval["accuracy"]
+
+cnn_test_accuracy
+```
+
+# **Predictions and Confusion Matrix**
+
+```{r}
+# Predictions and confusion matrix
+cnn_prob <- cnn_mnist %>% predict(x_test_cnn)
+
+cnn_pred_class <- apply(cnn_prob, 1, which.max) - 1
+
+cnn_conf_matrix <- table(
+  Actual = y_test_raw,
+  Predicted = cnn_pred_class
+)
+
+cnn_conf_matrix
+```
+
+# **Macro-F1 Function**
+
+```{r}
+# Macro-f1 function
+macro_f1_score <- function(actual, predicted) {
+  
+  classes <- sort(unique(actual))
+  
+  f1_values <- sapply(classes, function(cls) {
+    
+    tp <- sum(actual == cls & predicted == cls)
+    fp <- sum(actual != cls & predicted == cls)
+    fn <- sum(actual == cls & predicted != cls)
+    
+    precision <- ifelse((tp + fp) == 0, 0, tp / (tp + fp))
+    recall <- ifelse((tp + fn) == 0, 0, tp / (tp + fn))
+    
+    f1 <- ifelse((precision + recall) == 0, 0,
+                 2 * precision * recall / (precision + recall))
+    
+    return(f1)
+  })
+  
+  mean(f1_values)
+}
+
+cnn_macro_f1 <- macro_f1_score(y_test_raw, cnn_pred_class)
+
+cnn_results <- data.frame(
+  Model = "2D-CNN",
+  Dataset = "MNIST",
+  Test_Accuracy = round(as.numeric(cnn_test_accuracy), 4),
+  Macro_F1 = round(cnn_macro_f1, 4),
+  Train_Time_Per_Epoch_Seconds = round(cnn_time_per_epoch, 2)
+)
+
+cnn_results
+```
+
+# **Interpretation**
+
+The 2D-CNN was trained using the Adam optimizer and categorical cross-entropy loss, consistent with the DNN classification model in Part I. Early stopping with patience 5 was used to stop training when validation loss stopped improving. The model achieved a test accuracy of `r round(as.numeric(cnn_test_accuracy), 4)` and a macro-F1 score of `r round(cnn_macro_f1, 4)`. The confusion matrix shows the distribution of correct and incorrect predictions across the ten digit classes.
+
+# **PARAMETER COUNT FUNCTION**
+
+```{r}
+# Parameter count function
+count_trainable_params <- function(model) {
+  sum(sapply(model$trainable_weights, keras::k_count_params))
+}
+
+cnn_params <- count_trainable_params(cnn_mnist)
+
+cnn_params
+```
+
+# **1D-CNN for Jena Regression**
+
+```{r}
+# Build the 1D-CNN for Jena regression
+cnn1d_jena <- keras_model_sequential() %>%
+  layer_conv_1d(
+    filters = 32,
+    kernel_size = 5,
+    activation = "relu",
+    padding = "same",
+    input_shape = c(120, num_features)
+  ) %>%
+  layer_conv_1d(
+    filters = 64,
+    kernel_size = 5,
+    activation = "relu",
+    padding = "same"
+  ) %>%
+  layer_max_pooling_1d(pool_size = 2) %>%
+  layer_global_average_pooling_1d() %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dense(units = 1, activation = "linear")
+
+summary(cnn1d_jena)
+```
+
+# **Interpretaton**
+
+The architecture of the 1D-CNN was intended for inputs of size `120 x N`, where the integer 120 refers to the last 120 hourly records, and the other dimension corresponds to the predictor variables of the atmospheric features. There are two layers of Conv1D layers activated by the ReLU function, followed by one MaxPooling1D layer, one Global Average Pooling 1D layer, and finally a single output neurone using a linear activation function since we are performing regression.
+
+# **b.Justify kernel size and temporal receptive field**
+
+The Conv1D filters have a kernel size of 5. As Jena's dataset has been resampled to hourly data, this implies that each of the convolution kernels considers five hours' local temporal context. This ensures that the model can identify local weather patterns such as rising temperatures, cooling temperatures, humidity, and atmospheric pressure. Adding a second layer of Conv1D filters enables the model to consider a larger temporal window. The first layer extracts local five-hour windows, while the second layer fuses those patterns to identify more general temporal patterns. Consequently, while each convolution filter considers only five hours of temporal data, by stacking them together, the model is able to identify more complex patterns over a larger window of 120 hours. A kernel size of 5 was selected since this value is adequate to capture short-term weather variability without oversmoothing the time series data.
+
+# **Compile the 1D-CNN**
+
+```{r}
+# Compile the 1D-CNN
+cnn1d_jena %>% compile(
+  optimizer = optimizer_adam(),
+  loss = "mae",
+  metrics = c("mae")
+)
+
+early_stop_cnn1d <- callback_early_stopping(
+  monitor = "val_mae",
+  patience = 5,
+  restore_best_weights = TRUE
+)
+```
+
+# **Train the 1D-CNN**
+
+```{r}
+# Train 1d-cnn
+start_time <- Sys.time()
+
+history_cnn1d_jena <- cnn1d_jena %>% fit(
+  train_gen,
+  steps_per_epoch = steps_per_epoch,
+  epochs = epochs,
+  validation_data = val_gen,
+  validation_steps = validation_steps,
+  callbacks = list(early_stop_cnn1d)
+)
+
+end_time <- Sys.time()
+
+cnn1d_total_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+cnn1d_epochs_run <- length(history_cnn1d_jena$metrics$loss)
+cnn1d_time_per_epoch <- cnn1d_total_time / cnn1d_epochs_run
+```
+
+# **TEST EVALUATION**
+
+```{r}
+# Test evaluation
+cnn1d_pred <- cnn1d_jena %>% predict(x_test_jena)
+cnn1d_pred <- as.numeric(cnn1d_pred)
+
+cnn1d_mae <- mean(abs(y_test_jena - cnn1d_pred))
+
+cnn1d_rmse <- sqrt(mean((y_test_jena - cnn1d_pred)^2))
+
+cnn1d_r2 <- 1 - sum((y_test_jena - cnn1d_pred)^2) /
+  sum((y_test_jena - mean(y_test_jena))^2)
+
+cnn1d_params <- count_trainable_params(cnn1d_jena)
+
+cnn1d_results <- data.frame(
+  Model = "1D-CNN",
+  Test_MAE = round(cnn1d_mae, 4),
+  Test_RMSE = round(cnn1d_rmse, 4),
+  Test_R2 = round(cnn1d_r2, 4),
+  Parameters = cnn1d_params,
+  Train_Time_Per_Epoch_Seconds = round(cnn1d_time_per_epoch, 2)
+)
+
+cnn1d_results
+```
+
+# **Compare 1D-CNN with DNN Baseline**
+
+```{r}
+# Comparing 1d-cnn with dnn baseline
+jena_dnn_cnn_comparison <- data.frame(
+  Model = c("DNN Baseline", "1D-CNN"),
+  Test_MAE = c(round(test_mae, 4), round(cnn1d_mae, 4)),
+  Test_RMSE = c(round(test_rmse, 4), round(cnn1d_rmse, 4)),
+  Test_R2 = c(round(test_r2, 4), round(cnn1d_r2, 4)),
+  Parameters = c(
+    ifelse(exists("params_no_reg"), params_no_reg, NA),
+    cnn1d_params
+  ),
+  Train_Time_Per_Epoch_Seconds = c(
+    ifelse(exists("dnn_reg_time_per_epoch"), round(dnn_reg_time_per_epoch, 2), NA),
+    round(cnn1d_time_per_epoch, 2)
+  )
+)
+
+jena_dnn_cnn_comparison
+```
+
+# **Interpretation**
+
+The 1D-CNN was trained using Adam optimization and MAE loss, following the same evaluation setting as the DNN regression baseline. On the Jena test set, the model achieved a MAE of `r round(cnn1d_mae, 4)`, RMSE of `r round(cnn1d_rmse, 4)`, and R² of `r round(cnn1d_r2, 4)`. Compared with the DNN baseline, the 1D-CNN preserves the temporal structure of the 120-hour input window. The DNN flattens the time-series input and treats all lagged values as ordinary features, while the 1D-CNN applies filters across consecutive hours. Therefore, the 1D-CNN is theoretically better suited to capturing local temporal dependencies in climate data. If the 1D-CNN achieves a lower MAE and RMSE or a higher R² than the DNN, this indicates that exploiting temporal locality improves forecasting performance.
+
+# **Part III: Recurrent Neural Network (LSTM)**
+
+
+## **a. Why a vanilla Simple RNN struggles with sequences of 120+ steps**
+
+The standard vanilla Simple Recurrent Neural Network has problems processing sequences that are too long, since it requires the passing of information through a recurrent function repeatedly at each time step. When back propagation through time occurs, the gradient gets multiplied repeatedly by recurrent weight matrices. In case these multiplications produce values less than one, then the gradient gets vanishingly small during back propagation.
+
+## **b. How LSTM gates carry information over long horizons**
+
+The Long Short-Term Memory network solves the problem of vanishing gradients using the concept of cell state and three types of gates: the forget gate, the input gate, and the output gate. The function of the forget gate is to identify whether information stored previously in the cell state must be forgotten or kept. The input gate determines the amount of information to add to the cell state. The output gate regulates the amount of information that is transferred from the cell state to the hidden state for use in predictions. Cell state enables the movement of information through several time steps with fewer non-linear transformations. For this reason, it becomes easier for LSTM to remember critical information in the long term. The concept is beneficial in the Jena climate example because future temperature at 24 hours could depend not only on the immediate one hour but also on daily and multi-day patterns in the lookback window of 120 hours.
+
+#### **c. Why treating MNIST rows as time steps is valid but suboptimal**
+
+Treating MNIST images as sequences is valid because each image can be represented as 28 rows, where each row contains 28 pixel values. Under this representation, the LSTM processes the image row by row as a sequence of 28 time steps with 28 features at each step. However, this is a suboptimal use of LSTM because MNIST is primarily a spatial image problem, not a temporal sequence problem. The arrangement of pixels contains two-dimensional spatial structure, including local strokes, curves, and edges. A CNN is better suited to this structure because its filters move across both height and width and directly capture local spatial patterns. Using an LSTM for MNIST shows the importance of inductive bias. Even if an LSTM has enough capacity to classify digits, its sequential bias does not match the image structure as naturally as the spatial locality and parameter sharing bias of a CNN. Therefore, the CNN is expected to outperform the LSTM on MNIST classification.
+
+# **LSTM Model for Jena Regression**
+
+```{r}
+# Building the LSTM model for Jena regression
+lstm_jena <- keras_model_sequential() %>%
+  
+  # First LSTM layer (returns sequences)
+  layer_lstm(
+    units = 64,
+    return_sequences = TRUE,
+    input_shape = c(120, num_features),
+    recurrent_dropout = 0.2
+  ) %>%
+  
+  # Second LSTM layer
+  layer_lstm(
+    units = 32,
+    return_sequences = FALSE,
+    recurrent_dropout = 0.2
+  ) %>%
+  
+  # Dense output
+  layer_dense(units = 1, activation = "linear")
+
+summary(lstm_jena)
+```
+
+# Interpretation
+
+Input for the LSTM model was set to be of size `(120, number of predictors)` since the lookback period is of 120 hours. Two LSTM layers were added, and the first layer’s return sequences attribute was set to True in order for the second LSTM layer to process the whole temporal information. Recurrent dropout was incorporated into the model to avoid overfitting by randomly dropping units from the recurrent neural network. Linear activation function was chosen for the output layer due to the regression problem.
+
+# **b. Train and Evaluate LSTM(COMPILE LSTM MODEL)**
+
+```{r}
+# Compiling lstm model
+lstm_jena %>% compile(
+  optimizer = optimizer_adam(),
+  loss = "mae",
+  metrics = c("mae")
+)
+
+early_stop_lstm <- callback_early_stopping(
+  monitor = "val_mae",
+  patience = 5,
+  restore_best_weights = TRUE
+)
+```
+
+# **TRAIN LSTM**
+
+```{r}
+# Training lstm
+start_time <- Sys.time()
+
+history_lstm_jena <- lstm_jena %>% fit(
+  train_gen,
+  steps_per_epoch = steps_per_epoch,
+  epochs = epochs,
+  validation_data = val_gen,
+  validation_steps = validation_steps,
+  callbacks = list(early_stop_lstm)
+)
+
+end_time <- Sys.time()
+
+lstm_total_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+lstm_epochs_run <- length(history_lstm_jena$metrics$loss)
+lstm_time_per_epoch <- lstm_total_time / lstm_epochs_run
+```
+
+# **TEST EVALUATION**
+
+```{r}
+# Test evaluation
+lstm_pred <- lstm_jena %>% predict(x_test_jena)
+lstm_pred <- as.numeric(lstm_pred)
+
+lstm_mae <- mean(abs(y_test_jena - lstm_pred))
+
+lstm_rmse <- sqrt(mean((y_test_jena - lstm_pred)^2))
+
+lstm_r2 <- 1 - sum((y_test_jena - lstm_pred)^2) /
+  sum((y_test_jena - mean(y_test_jena))^2)
+
+lstm_params <- count_trainable_params(lstm_jena)
+
+lstm_results <- data.frame(
+  Model = "LSTM",
+  Test_MAE = round(lstm_mae, 4),
+  Test_RMSE = round(lstm_rmse, 4),
+  Test_R2 = round(lstm_r2, 4),
+  Parameters = lstm_params,
+  Train_Time_Per_Epoch_Seconds = round(lstm_time_per_epoch, 2)
+)
+
+lstm_results
+```
+
+# **c. Ablation: SimpleRNN vs LSTM**
+
+```{r}
+# Simple rnn model (ablation)
+rnn_jena <- keras_model_sequential() %>%
+  layer_simple_rnn(
+    units = 64,
+    return_sequences = TRUE,
+    input_shape = c(120, num_features)
+  ) %>%
+  layer_simple_rnn(units = 32) %>%
+  layer_dense(units = 1, activation = "linear")
+
+rnn_jena %>% compile(
+  optimizer = optimizer_adam(),
+  loss = "mae",
+  metrics = c("mae")
+)
+```
+
+# **Train the SimpleRNN**
+
+```{r}
+# Train simple rnn
+
+history_rnn_jena <- rnn_jena %>% fit(
+  train_gen,
+  steps_per_epoch = steps_per_epoch,
+  epochs = epochs,
+  validation_data = val_gen,
+  validation_steps = validation_steps,
+  callbacks = list(early_stop_lstm)
+)
+```
+
+# **Test Performance of SimpleRNN**
+
+```{r}
+# Test performance of simple rnn
+
+rnn_pred <- rnn_jena %>% predict(x_test_jena)
+rnn_pred <- as.numeric(rnn_pred)
+
+rnn_mae <- mean(abs(y_test_jena - rnn_pred))
+
+rnn_mae
+```
+
+### **Interpretation LSTM vs Simple RNN for Jena Regression**
+
+The training process for the LSTM model was performed in the same way as for the DNN model. The test results show that the LSTM network reached the values of MAE, RMSE, and R² equal to `r round(lstm_mae, 4)`, and `r round(lstm_r2, 4)` , respectively. In order to find out how important the property of memory is for the LSTM, an ablation model based on the SimpleRNN with the same structure as the LSTM model was trained. The result obtained from the Simple RNN showed that the test MAE equals `r round(rnn_mae, 4)`. Thus, the reason for the better performance of the LSTM model is associated with overcoming the problem of the vanishing gradient that occurs while training the RNN. Infact, during training, when passing through many steps, the gradient loses its value and makes it difficult for the RNN model to learn some patterns in the sequence. 
+
+# **III.C LSTM for Jena Classification**
+
+```{r}
+# Prepare jena classification data
+jena_class_data <- jena_hourly %>%
+  arrange(Date.Hour) %>%
+  mutate(
+    temp_24h_ahead = lead(T..degC., 24),
+    temp_class = case_when(
+      temp_24h_ahead < 0 ~ "Cold",
+      temp_24h_ahead >= 0 & temp_24h_ahead < 10 ~ "Cool",
+      temp_24h_ahead >= 10 & temp_24h_ahead < 20 ~ "Mild",
+      temp_24h_ahead >= 20 ~ "Warm"
+    )
+  ) %>%
+  filter(!is.na(temp_24h_ahead), !is.na(temp_class))
+
+train_class <- jena_class_data %>%
+  filter(Date.Hour >= ymd_hms("2009-01-01 00:00:00"),
+         Date.Hour <  ymd_hms("2015-01-01 00:00:00"))
+
+val_class <- jena_class_data %>%
+  filter(Date.Hour >= ymd_hms("2015-01-01 00:00:00"),
+         Date.Hour <  ymd_hms("2016-01-01 00:00:00"))
+
+test_class <- jena_class_data %>%
+  filter(Date.Hour >= ymd_hms("2016-01-01 00:00:00"),
+         Date.Hour <  ymd_hms("2017-01-01 00:00:00"))
+```
+
+# **CLASSIFICATION DATA GENERATOR**
+
+```{r}
+jena_class_generator <- function(data,
+                                 lookback = 120,
+                                 delay = 24,
+                                 step = 1,
+                                 batch_size = 128,
+                                 shuffle = FALSE) {
+  
+  class_levels <- c("Cold", "Cool", "Mild", "Warm")
+  
+  predictor_cols <- names(data %>%
+                            select(where(is.numeric))) 
+  
+  predictor_cols <- setdiff(predictor_cols, c("temp_24h_ahead"))
+  
+  data_values <- as.matrix(data[, predictor_cols])
+  
+  max_index <- nrow(data_values) - delay - 1
+  
+  function() {
+    
+    if (shuffle) {
+      rows <- sample((lookback + 1):max_index, batch_size)
+    } else {
+      rows <- seq(lookback + 1, min(lookback + batch_size, max_index))
+    }
+    
+    samples <- array(0, dim = c(length(rows), lookback, ncol(data_values)))
+    targets <- matrix(0, nrow = length(rows), ncol = 4)
+    
+    for (j in seq_along(rows)) {
+      idx <- rows[j]
+      indices <- seq(idx - lookback, idx - 1, by = step)
+      
+      samples[j,,] <- data_values[indices,]
+      
+      class_id <- match(data$temp_class[idx + delay], class_levels)
+      targets[j, class_id] <- 1
+    }
+    
+    list(samples, targets)
+  }
+}
+```
+
+# **CREATE CLASSIFICATION GENERATORS**
+
+```{r}
+# Create classification generators
+train_class_gen <- jena_class_generator(
+  train_class,
+  batch_size = 128,
+  shuffle = TRUE
+)
+
+val_class_gen <- jena_class_generator(
+  val_class,
+  batch_size = 128,
+  shuffle = FALSE
+)
+
+test_class_gen <- jena_class_generator(
+  test_class,
+  batch_size = 128,
+  shuffle = FALSE
+)
+
+class_batch <- train_class_gen()
+
+dim(class_batch[[1]])
+dim(class_batch[[2]])
+```
+
+# **LSTM Model for Jena Classification**
+
+```{r}
+# Building the Jena LSTM classification model
+num_features_class <- dim(class_batch[[1]])[3]
+
+lstm_jena_class <- keras_model_sequential() %>%
+  layer_lstm(
+    units = 64,
+    return_sequences = TRUE,
+    input_shape = c(120, num_features_class),
+    recurrent_dropout = 0.2
+  ) %>%
+  layer_lstm(
+    units = 32,
+    recurrent_dropout = 0.2
+  ) %>%
+  layer_dense(units = 4, activation = "softmax")
+
+summary(lstm_jena_class)
+```
+
+# **Interpretation**
+
+For  Jena classification, a softmax layer with four neurones was used instead of the regression output layer. The first, second, third, and fourth neurones represent the categories cold, cool, mild, and “warm” temperatures, respectively. The softmax layer was suitable since its purpose was to transform the output of the model into probabilities summing up to one. The loss function was also switched from MAE to categorical cross-entropy.
+
+# **b. Train and evaluate: accuracy, macro-F1, confusion matrix**
+
+```{r}
+# Compiling lstm classification model
+lstm_jena_class %>% compile(
+  optimizer = optimizer_adam(),
+  loss = "categorical_crossentropy",
+  metrics = c("accuracy")
+)
+
+early_stop_lstm_class <- callback_early_stopping(
+  monitor = "val_loss",
+  patience = 5,
+  restore_best_weights = TRUE
+)
+```
+
+# **TRAIN LSTM CLASSIFICATION MODEL**
+
+```{r}
+# Training lstm classification model
+history_lstm_jena_class <- lstm_jena_class %>% fit(
+  train_class_gen,
+  steps_per_epoch = steps_per_epoch,
+  epochs = epochs,
+  validation_data = val_class_gen,
+  validation_steps = validation_steps,
+  callbacks = list(early_stop_lstm_class)
+)
+```
+
+# **CREATE TEST CLASSIFICATION ARRAYS**
+
+```{r}
+# Creating test classification arrays
+make_class_sequences <- function(data, lookback = 120, delay = 24) {
+  
+  class_levels <- c("Cold", "Cool", "Mild", "Warm")
+  
+  predictor_cols <- names(data %>% select(where(is.numeric)))
+  predictor_cols <- setdiff(predictor_cols, c("temp_24h_ahead"))
+  
+  data_values <- as.matrix(data[, predictor_cols])
+  max_index <- nrow(data_values) - delay
+  
+  rows <- (lookback + 1):max_index
+  
+  samples <- array(0, dim = c(length(rows), lookback, ncol(data_values)))
+  targets <- matrix(0, nrow = length(rows), ncol = 4)
+  
+  for (j in seq_along(rows)) {
+    idx <- rows[j]
+    samples[j,,] <- data_values[(idx - lookback):(idx - 1),]
+    
+    class_id <- match(data$temp_class[idx + delay], class_levels)
+    targets[j, class_id] <- 1
+  }
+  
+  list(samples = samples, targets = targets)
+}
+
+test_class_seq <- make_class_sequences(test_class)
+
+x_test_jena_class <- test_class_seq$samples
+y_test_jena_class <- test_class_seq$targets
+```
+
+# **TEST PREDICTION**
+
+```{r}
+lstm_class_prob <- lstm_jena_class %>% predict(x_test_jena_class)
+
+lstm_class_pred <- apply(lstm_class_prob, 1, which.max)
+
+lstm_class_actual <- apply(y_test_jena_class, 1, which.max)
+
+class_levels <- c("Cold", "Cool", "Mild", "Warm")
+
+lstm_class_pred_label <- factor(class_levels[lstm_class_pred], levels = class_levels)
+lstm_class_actual_label <- factor(class_levels[lstm_class_actual], levels = class_levels)
+```
+
+# **ACCURACY, MACRO-F1, CONFUSION MATRIX**
+
+```{r}
+lstm_class_accuracy <- mean(lstm_class_pred_label == lstm_class_actual_label)
+
+macro_f1_score <- function(actual, predicted) {
+  
+  classes <- levels(actual)
+  
+  f1_values <- sapply(classes, function(cls) {
+    
+    tp <- sum(actual == cls & predicted == cls)
+    fp <- sum(actual != cls & predicted == cls)
+    fn <- sum(actual == cls & predicted != cls)
+    
+    precision <- ifelse((tp + fp) == 0, 0, tp / (tp + fp))
+    recall <- ifelse((tp + fn) == 0, 0, tp / (tp + fn))
+    
+    ifelse((precision + recall) == 0, 0,
+           2 * precision * recall / (precision + recall))
+  })
+  
+  mean(f1_values)
+}
+
+lstm_class_macro_f1 <- macro_f1_score(
+  lstm_class_actual_label,
+  lstm_class_pred_label
+)
+
+lstm_class_conf_matrix <- table(
+  Actual = lstm_class_actual_label,
+  Predicted = lstm_class_pred_label
+)
+
+lstm_class_results <- data.frame(
+  Model = "LSTM",
+  Dataset = "Jena 4-Class",
+  Test_Accuracy = round(lstm_class_accuracy, 4),
+  Macro_F1 = round(lstm_class_macro_f1, 4)
+)
+
+lstm_class_results
+lstm_class_conf_matrix
+```
+
+# **Interpretation**
+
+The accuracy for the LSTM classification model was r round(lstm_class_accuracy, 4) while the macro F1-score was r round(lstm_class_macro_f1, 4) . The confusion matrix displays the classification of the four temperature classes. It was likely that misclassifications will happen between classes that have nearby temperature ranges, such as Cool vs. Mild and Mild vs. Warm.
+
+# **c. Discussion: Regression or classification advantage?**
+
+The LSTM model shows a greater advantage over the DNN in the case of the regression problem than over the classification problem. When dealing with a regression problem, the LSTM model predicts the temperature for the next 24 hours, hence making use of learned temporal relationships, daily cycles, and weather patterns over a period of 120 hours. On the other hand, the regression output is changed into four broad classes when using the classification model. As a result, valuable information is lost since temperatures near the boundary of each category could be classified into different classes despite having similar numerical values.
+
+# **III.D LSTM for MNIST Sequential Image**
+
+```{r}
+x_train_lstm_mnist <- array_reshape(x_train_final, c(nrow(x_train_final), 28, 28))
+x_val_lstm_mnist   <- array_reshape(x_val, c(nrow(x_val), 28, 28))
+x_test_lstm_mnist  <- array_reshape(x_test, c(nrow(x_test), 28, 28))
+
+dim(x_train_lstm_mnist)
+dim(x_val_lstm_mnist)
+dim(x_test_lstm_mnist)
+```
+
+# **Interpretation**
+
+The images from the MNIST dataset were converted to have a series of 28 timesteps, with each timestep consisting of one row of pixels of size 28 x 28. Therefore, each image used for training had an input shape of 28 timesteps, with each timestep representing one row of pixels.
+
+# **b. Design and train LSTM model**
+
+```{r}
+# Building the LSTM model for MNIST
+lstm_mnist <- keras_model_sequential() %>%
+  layer_lstm(
+    units = 64,
+    input_shape = c(28, 28),
+    recurrent_dropout = 0.2
+  ) %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dense(units = 10, activation = "softmax")
+
+summary(lstm_mnist)
+```
+
+# **COMPILE MNIST LSTM**
+
+```{r}
+# Compiling mnist lstm
+lstm_mnist %>% compile(
+  optimizer = optimizer_adam(),
+  loss = "categorical_crossentropy",
+  metrics = c("accuracy")
+)
+
+early_stop_lstm_mnist <- callback_early_stopping(
+  monitor = "val_loss",
+  patience = 5,
+  restore_best_weights = TRUE
+)
+```
+
+# **TRAIN MNIST LSTM**
+
+```{r}
+start_time <- Sys.time()
+
+history_lstm_mnist <- lstm_mnist %>% fit(
+  x_train_lstm_mnist,
+  y_train_cat,
+  epochs = 20,
+  batch_size = 128,
+  validation_data = list(x_val_lstm_mnist, y_val_cat),
+  callbacks = list(early_stop_lstm_mnist)
+)
+
+end_time <- Sys.time()
+
+lstm_mnist_total_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+lstm_mnist_epochs_run <- length(history_lstm_mnist$metrics$loss)
+lstm_mnist_time_per_epoch <- lstm_mnist_total_time / lstm_mnist_epochs_run
+```
+
+### **c. Test accuracy and comparison with CNN**
+
+```{r}
+lstm_mnist_eval <- lstm_mnist %>% evaluate(
+  x_test_lstm_mnist,
+  y_test_cat
+)
+
+lstm_mnist_test_accuracy <- lstm_mnist_eval["accuracy"]
+
+lstm_mnist_test_accuracy
+```
+
+# **PARAMETER COUNT**
+
+```{r}
+lstm_mnist_params <- count_trainable_params(lstm_mnist)
+
+lstm_mnist_params
+```
+
+# **Compare LSTM with CNN**
+
+```{r}
+mnist_lstm_cnn_comparison <- data.frame(
+  Model = c("2D-CNN", "LSTM Sequential Image"),
+  Test_Accuracy = c(
+    round(as.numeric(cnn_test_accuracy), 4),
+    round(as.numeric(lstm_mnist_test_accuracy), 4)
+  ),
+  Parameters = c(
+    cnn_params,
+    lstm_mnist_params
+  ),
+  Train_Time_Per_Epoch_Seconds = c(
+    round(cnn_time_per_epoch, 2),
+    round(lstm_mnist_time_per_epoch, 2)
+  )
+)
+
+mnist_lstm_cnn_comparison
+```
+
+# **Interpretation**
+
+The comparison between the 2D-CNN and LSTM models shows that the 2D-CNN achieved slightly higher classification accuracy (98.81%) compared to the LSTM model (98.59%). This indicates that the CNN model performed marginally better in classifying the image dataset. However, the CNN model required significantly more parameters (1,625,866) and a longer training time per epoch (350.91 seconds), making it computationally more expensive. In contrast, the LSTM model used far fewer parameters (33,418) and trained much faster (36.73 seconds per epoch).
+
+# **Part IV.1 Design Brief — Custom Hybrid Architecture**
+
+For this task, a hybrid CNN–LSTM architecture was used to predict temperatures in the Jena climate dataset. The model combines a 1D Convolutional Neural Network (CNN) with a Long Short-Term Memory (LSTM) network so that both short-term and long-term patterns in the weather data can be captured effectively. The motivation for using this hybrid approach comes from the limitations of the individual models. The baseline Deep Neural Network (DNN) treats the 120-hour input window as a single vector, which means the sequential nature of the data is ignored. Because of this, the model struggles to learn important local temporal patterns within the climate variables. To improve this, the CNN component was introduced to capture short-term patterns such as hourly changes in temperature, humidity, and pressure. While CNNs are very good at extracting these local features, they are less effective at learning relationships that span several days. This is where the LSTM component becomes useful. The LSTM is designed to learn long-term dependencies and sequential relationships in time-series data.
+
+# **IV.1 Design Brief (Using Suggested Hybrid Pattern: CNN–LSTM)**
+
+The CNN–LSTM hybrid model used in this project combines 1D convolutional layers with LSTM layers for temperature prediction using the Jena climate dataset. This architecture was selected to address the limitations of using individual models such as DNN, CNN, or LSTM alone. The DNN model ignores the sequential nature of the data because it flattens the input before training, making it difficult to capture temporal relationships. The 1D-CNN improves upon this by learning short-term temporal patterns and local dependencies within the climate variables. However, CNNs may struggle to capture long-term dependencies across the full 120-hour look-back window. On the other hand, the LSTM network is effective at learning long-term temporal dependencies through its memory and gating mechanisms, but it may not be as efficient as CNNs in extracting short-term local patterns. By combining the two architectures, the hybrid CNN–LSTM model benefits from the strengths of both approaches. In this framework, the Conv1D layers first extract local temporal features, such as hourly changes in temperature and humidity. These extracted feature sequences are then passed to the LSTM layer, which learns the long-term relationships and sequential dependencies within the data. As a result, the model incorporates two important inductive biases: locality through CNNs and long-term memory through LSTMs. The Jena climate dataset was well suited for evaluating this hybrid architecture because it contains both short-term weather fluctuations and longer-term temporal trends. Since the task involves forecasting temperature 24 hours ahead using the previous 120 hours of observations, the CNN–LSTM model is expected to effectively capture both local and sequential patterns in the climate data.
+
+
+# **Part IV: Custom Hybrid Architecture**
+
+```{r}
+hybrid_input <- layer_input(shape = c(120, num_features), name = "Input_120_hours")
+
+hybrid_output <- hybrid_input %>%
+  layer_conv_1d(
+    filters = 32,
+    kernel_size = 5,
+    activation = "relu",
+    padding = "same",
+    name = "Conv1D_Local_Features_1"
+  ) %>%
+  layer_conv_1d(
+    filters = 64,
+    kernel_size = 5,
+    activation = "relu",
+    padding = "same",
+    name = "Conv1D_Local_Features_2"
+  ) %>%
+  layer_max_pooling_1d(
+    pool_size = 2,
+    name = "MaxPooling_Temporal_Reduction"
+  ) %>%
+  layer_lstm(
+    units = 64,
+    recurrent_dropout = 0.2,
+    name = "LSTM_Long_Range_Dependencies"
+  ) %>%
+  layer_dense(
+    units = 64,
+    activation = "relu",
+    name = "Dense_Feature_Integration"
+  ) %>%
+  layer_dense(
+    units = 1,
+    activation = "linear",
+    name = "Temperature_Output"
+  )
+
+hybrid_cnn_lstm <- keras_model(
+  inputs = hybrid_input,
+  outputs = hybrid_output,
+  name = "CNN_LSTM_Hybrid_Jena_Regression"
+)
+
+summary(hybrid_cnn_lstm)
+```
+
+# **COMPILE HYBRID MODEL**
+
+```{r}
+hybrid_cnn_lstm %>% compile(
+  optimizer = optimizer_adam(),
+  loss = "mae",
+  metrics = c("mae")
+)
+
+early_stop_hybrid <- callback_early_stopping(
+  monitor = "val_mae",
+  patience = 5,
+  restore_best_weights = TRUE
+)
+```
+
+# **TRAIN HYBRID MODEL**
+
+```{r}
+start_time <- Sys.time()
+
+history_hybrid <- hybrid_cnn_lstm %>% fit(
+  train_gen,
+  steps_per_epoch = steps_per_epoch,
+  epochs = epochs,
+  validation_data = val_gen,
+  validation_steps = validation_steps,
+  callbacks = list(early_stop_hybrid)
+)
+
+end_time <- Sys.time()
+
+hybrid_total_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+hybrid_epochs_run <- length(history_hybrid$metrics$loss)
+hybrid_time_per_epoch <- hybrid_total_time / hybrid_epochs_run
+```
+
+### **CNN-LSTM Hybrid Architecture Diagram**
+
+Input Layer\
+`(120, number of predictors)`\
+⬇\
+Conv1D Layer 1\
+`32 filters, kernel size = 5, ReLU, same padding`\
+⬇\
+Conv1D Layer 2\
+`64 filters, kernel size = 5, ReLU, same padding`\
+⬇\
+MaxPooling1D\
+`pool size = 2`\
+⬇\
+LSTM Layer\
+`64 units, recurrent dropout = 0.20`\
+⬇\
+Dense Layer\
+`64 neurons, ReLU`\
+⬇\
+Output Layer\
+`1 neuron, linear activation`
+
+### **Implementation of the CNN-LSTM Hybrid Architecture**
+
+The CNN-LSTM hybrid model was built using the Keras Functional API, satisfying the project requirements to develop a non-sequential model architecture, which should be constructed explicitly using the 'function' and connected layers. The inputs consist of sequences of 120 hours (shape `(120, number of predictors)`), containing the last 120-hour observation records for all predictor variables. The first two convolutional layers of shape `(number of filters = 32, filter length = 5, activation = ReLu)` allow capturing the local features in the input sequences. Each filter represents a five-hour period, which makes possible the extraction of short-time patterns. The next MaxPooling1D layer summarises the local features and compresses the input. Finally, an LSTM layer with 64 neurones enables the network to learn the dependencies between the elements within the sequence. The dense layer aggregates the results, and the linear activation neurone produces a continuous 24-hour ahead prediction of temperature. The training of the model uses the same chronological data splits, Adam optimisation, and Mean Absolute Error (MAE) loss function as the other regression architectures.
+
+# **IV.3 HYPERPARAMETER: NUMBER OF FILTERS**
+
+```{r}
+filter_values <- c(16, 32, 64)
+
+val_mae_results <- c()
+
+for (f in filter_values) {
+  
+  model <- keras_model(
+    inputs = hybrid_input,
+    outputs =
+      hybrid_input %>%
+      layer_conv_1d(filters = f, kernel_size = 5, activation = "relu", padding = "same") %>%
+      layer_conv_1d(filters = f * 2, kernel_size = 5, activation = "relu", padding = "same") %>%
+      layer_max_pooling_1d(pool_size = 2) %>%
+      layer_lstm(units = 64, recurrent_dropout = 0.2) %>%
+      layer_dense(units = 64, activation = "relu") %>%
+      layer_dense(units = 1, activation = "linear")
+  )
+  
+  model %>% compile(
+    optimizer = optimizer_adam(),
+    loss = "mae",
+    metrics = c("mae")
+  )
+  
+  history <- model %>% fit(
+    train_gen,
+    steps_per_epoch = steps_per_epoch,
+    epochs = epochs,
+    validation_data = val_gen,
+    validation_steps = validation_steps,
+    callbacks = list(early_stop_hybrid),
+    verbose = 0
+  )
+  
+  val_mae_results <- c(val_mae_results, min(history$metrics$val_mae))
+}
+
+sensitivity_results <- data.frame(
+  Filters = filter_values,
+  Validation_MAE = round(val_mae_results, 4)
+)
+
+sensitivity_results
+```
+
+```{r}
+ggplot(sensitivity_results, aes(x = Filters, y = Validation_MAE)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Hyperparameter Sensitivity: Number of Filters vs Validation MAE",
+    x = "Number of Filters",
+    y = "Validation MAE"
+  ) +
+  theme_minimal()
+```
+
+### **Hyperparameter Sensitivity Analysis**
+
+The hyperparameter sensitivity analysis shows how the number of CNN filters affects the validation Mean Absolute Error (MAE) of the model. As the number of filters increased from 16 to 32, the validation MAE also increased from approximately 0.345 to 0.382, indicating a decline in model performance. However, when the number of filters was further increased to 64, the validation MAE decreased to about 0.357, showing an improvement compared to 32 filters. The model achieved the lowest validation MAE with 16 filters, suggesting that a smaller number of filters provided better generalization performance for this task. The results indicate that increasing the number of filters does not always improve model accuracy, and excessive filters may introduce unnecessary model complexity.
+
+
+# **HYBRID MODEL TEST EVALUATION**
+
+```{r}
+hybrid_pred <- hybrid_cnn_lstm %>% predict(x_test_jena)
+hybrid_pred <- as.numeric(hybrid_pred)
+
+hybrid_mae <- mean(abs(y_test_jena - hybrid_pred))
+hybrid_rmse <- sqrt(mean((y_test_jena - hybrid_pred)^2))
+hybrid_r2 <- 1 - sum((y_test_jena - hybrid_pred)^2) /
+  sum((y_test_jena - mean(y_test_jena))^2)
+
+hybrid_results <- data.frame(
+  Model = "CNN-LSTM Hybrid",
+  Test_MAE = round(hybrid_mae, 4),
+  Test_RMSE = round(hybrid_rmse, 4),
+  Test_R2 = round(hybrid_r2, 4)
+)
+
+hybrid_results
+```
+
+### **Evaluation and Reflection**
+The test evaluation results for the CNN–LSTM hybrid model indicate strong predictive performance on the Jena temperature dataset. The model achieved a Test MAE of 0.2716, meaning that the average prediction error was relatively low. In addition, the Test RMSE value of 0.3477 suggests that the model maintained good accuracy while minimizing larger prediction errors. The model also recorded a Test R square value of 0.8675, which shows that approximately 86.75% of the variation in temperature was explained by the hybrid model.
+
+
+# **Part V.1 Summary Tables**
+
+```{r}
+regression_summary <- data.frame(
+  Model = c("DNN", "1D-CNN", "LSTM", "CNN-LSTM Hybrid"),
+  
+  Test_MAE = c(
+    round(test_mae, 4),
+    round(cnn1d_mae, 4),
+    round(lstm_mae, 4),
+    round(hybrid_mae, 4)
+  ),
+  
+  Test_RMSE = c(
+    round(test_rmse, 4),
+    round(cnn1d_rmse, 4),
+    round(lstm_rmse, 4),
+    round(hybrid_rmse, 4)
+  ),
+  
+  Test_R2 = c(
+    round(test_r2, 4),
+    round(cnn1d_r2, 4),
+    round(lstm_r2, 4),
+    round(hybrid_r2, 4)
+  ),
+  
+  Parameters = c(
+    ifelse(exists("params_no_reg"), params_no_reg, NA),
+    cnn1d_params,
+    lstm_params,
+    count_trainable_params(hybrid_cnn_lstm)
+  ),
+  
+  Train_Time_Per_Epoch_Seconds = c(
+    ifelse(exists("dnn_reg_time_per_epoch"), round(dnn_reg_time_per_epoch, 2), NA),
+    round(cnn1d_time_per_epoch, 2),
+    round(lstm_time_per_epoch, 2),
+    round(hybrid_time_per_epoch, 2)
+  )
+)
+
+regression_summary
+```
+
+# **V.1 Classification Models Summary Table**
+
+```{r}
+classification_summary <- data.frame(
+  Model = c("DNN", "2D-CNN", "LSTM (MNIST)", "LSTM (Jena)"),
+  
+  Dataset = c("MNIST", "MNIST", "MNIST", "Jena 4-Class"),
+  
+  Test_Accuracy = c(
+    ifelse(exists("dnn_test_accuracy"), round(as.numeric(dnn_test_accuracy), 4), NA),
+    round(as.numeric(cnn_test_accuracy), 4),
+    round(as.numeric(lstm_mnist_test_accuracy), 4),
+    round(lstm_class_accuracy, 4)
+  ),
+  
+  Macro_F1 = c(
+    NA,  # optional if not computed for DNN MNIST
+    round(cnn_macro_f1, 4),
+    NA,  # optional
+    round(lstm_class_macro_f1, 4)
+  ),
+  
+  Parameters = c(
+    ifelse(exists("dnn_mnist_params"), dnn_mnist_params, NA),
+    cnn_params,
+    lstm_mnist_params,
+    count_trainable_params(lstm_jena_class)
+  ),
+  
+  Train_Time_Per_Epoch_Seconds = c(
+    ifelse(exists("dnn_time_per_epoch"), round(dnn_time_per_epoch, 2), NA),
+    round(cnn_time_per_epoch, 2),
+    round(lstm_mnist_time_per_epoch, 2),
+    NA
+  )
+)
+
+classification_summary
+```
+
+# **Summary of Model Performance**
+
+The table below shows the summary statistics from the comparison of the performances of the DNN, 1D-CNN, LSTM, and CNN-LSTM models in terms of their effectiveness in temperature prediction using Jena data. The performance indicators used in the comparison are MAE, RMSE, R², number of parameters, and training time. Lower values of MAE and RMSE imply high predictive accuracy while high values of R² represent high predictive capabilities. The classification summary table gives the comparison of models' performances on MNIST and Jena datasets with respect to accuracy and F1-macro scores. The CNN model is expected to give the best classification performance on the MNIST dataset because of its spatial feature extraction abilities. The LSTM on MNIST should give a slightly lower accuracy because the model assumes that images are sequential and not spatially structured. The CNN part helps the model learn short-term weather changes, while the LSTM remembers patterns over longer periods.
+# **V.2 Visualizations Plot: Regression Predictions vs Actual (Two Weeks)**
+
+```{r}
+two_weeks <- 24 * 14
+
+plot_data_2weeks <- data.frame(
+  Time = test_data$Date.Hour[(120 + 24 + 1):(120 + 24 + two_weeks)],
+  Actual = y_test_jena[1:two_weeks],
+  DNN = dnn_pred[1:two_weeks],
+  CNN1D = cnn1d_pred[1:two_weeks],
+  LSTM = lstm_pred[1:two_weeks],
+  Hybrid = hybrid_pred[1:two_weeks]
+)
+
+plot_long <- plot_data_2weeks %>%
+  pivot_longer(-Time, names_to = "Model", values_to = "Temperature")
+
+ggplot(plot_long, aes(x = Time, y = Temperature, color = Model)) +
+  geom_line() +
+  labs(
+    title = "Two-Week Temperature Forecast Comparison",
+    x = "Time",
+    y = "Temperature"
+  ) +
+  theme_minimal()
+```
+
+# **Bar Chart: Classification Accuracy**
+
+```{r}
+accuracy_data <- data.frame(
+  Model = c("DNN", "2D-CNN", "LSTM (MNIST)", "LSTM (Jena)"),
+  Dataset = c("MNIST", "MNIST", "MNIST", "Jena"),
+  Accuracy = c(
+    ifelse(exists("dnn_test_accuracy"), as.numeric(dnn_test_accuracy), NA),
+    as.numeric(cnn_test_accuracy),
+    as.numeric(lstm_mnist_test_accuracy),
+    lstm_class_accuracy
+  )
+)
+
+ggplot(accuracy_data, aes(x = Model, y = Accuracy, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "Classification Accuracy Comparison",
+    x = "Model",
+    y = "Accuracy"
+  ) +
+  theme_minimal()
+```
+
+# **Visualization of Model Performance**
+
+The regression plot compares predicted temperatures from different models against the actual observed values over a two-week window. The hybrid CNN-LSTM and LSTM models are expected to track the true temperature patterns more closely than the DNN and 1D-CNN models, especially during periods of rapid temperature change. The classification accuracy bar chart compares performance across MNIST and Jena datasets. The 2D-CNN achieves the highest accuracy on MNIST due to its ability to capture spatial patterns, while the LSTM models show competitive performance depending on how well the data structure aligns with sequential modelling assumptions.
+
+# **V.3 Statistical Comparison (Diebold–Mariano Test)**
+
+```{r}
+# Choosing the best model (LSTM vs Hybrid)
+errors_lstm <- y_test_jena - lstm_pred
+errors_hybrid <- y_test_jena - hybrid_pred
+
+dm_test_result <- dm.test(
+  e1 = errors_lstm,
+  e2 = errors_hybrid,
+  alternative = "two.sided",
+  power = 1
+)
+
+dm_test_result
+```
+
+# **Statistical Comparison of Forecast Accuracy**
+
+In order to test the forecasting accuracy of the two regression models that performed the best, a Diebold-Mariano (DM) test was carried out. This test assesses the statistical significance of the difference in errors in predictions between the two models. According to the null hypothesis, both the models are equally accurate in terms of their predictive ability. The alternative hypothesis, on the other hand, states that there is a discrepancy in their ability to predict. The Diebold–Mariano (DM) test result shows that there is a statistically significant difference in forecasting accuracy between the LSTM model and the hybrid CNN–LSTM model. The negative DM statistic (DM = −11.308) indicates that the hybrid model produced lower forecast errors and performed better than the standalone LSTM model.
+
+# **Critical Reflection**
+
+# **1. Best Architecture for Regression and Theoretical Justification**
+
+The CNN-LSTM combination had better results in Jena regression. It fits expectations since temperature prediction is concerned with short-term and long-term temporal dependencies. LSTM is capable of modelling long-term temporal dependencies via its ability to encode an inductive bias within its memory cells and gates. In addition, the CNN-LSTM combination improves the result by first learning the local features via convolutional operations and then encoding long-term temporal dependencies via LSTM. The result, therefore, can be attributed to both aspects.
+
+# **2. Best Architecture for MNIST Classification and Task-Architecture Fit**
+
+The model that achieved the highest accuracy for the MNIST dataset was the 2D-CNN. This is expected because there is high correspondence between the model and the task since images in the MNIST dataset have a specific structure that can be used by convolutional layers to detect edges, curves, and shapes in addition to exploiting the idea of parameter sharing and spatial invariance. On the other hand, the LSTM considers the images as sequences of rows, which does not consider the full extent of the 2D spatial structure of the images.
+
+# **3. Universal Approximation Theorem vs Practical Performance**
+
+As per the Universal Approximation Theorem, with enough neurones, the deep neural network can approximate any function. Nevertheless, the outcomes indicate that the deep neural network does not perform as effectively as the CNN or LSTM model in practice. The reason for this lies in the absence of appropriate inductive biases in the model for structured data such as images or sequences. While it is true that DNN is capable of learning these structures, it demands more data and parameter numbers, as well as increased training duration. Thus, the efficiency and effectiveness of the deep learning model depend not only on capacity but also on architecture.
